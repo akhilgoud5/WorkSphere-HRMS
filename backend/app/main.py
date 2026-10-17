@@ -1,0 +1,587 @@
+from fastapi import FastAPI, Depends, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from .database import Base, engine, get_db
+from . import models, schemas
+from .security import hash_password, verify_password, create_access_token
+from .dependencies import current_user, allow_roles
+from datetime import datetime, date
+from fastapi.security import OAuth2PasswordRequestForm
+from .models import Payroll
+
+Base.metadata.create_all(bind=engine)
+app = FastAPI(title="WorkSphere HRMS API", version="1.0.0",
+              description="Starter API for WorkSphere HR Management System")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    return {"message": "WorkSphere HRMS API is running", "docs": "/docs"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/auth/register", response_model=schemas.UserOut, status_code=201)
+def register(data: schemas.RegisterIn, db: Session = Depends(get_db)):
+    role = data.role.upper()
+    # Public registration must not let a new user grant themselves HR or ADMIN access.
+    if role != "EMPLOYEE":
+        raise HTTPException(status_code=400, detail="Public registration only supports EMPLOYEE role")
+    if db.query(models.User).filter(
+        (models.User.username == data.username) | (models.User.email == data.email)
+    ).first():
+        raise HTTPException(status_code=409, detail="Username or email already exists")
+    user = models.User(username=data.username, email=data.email,
+                       hashed_password=hash_password(data.password), role="EMPLOYEE")
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/auth/login")
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    user = db.query(models.User).filter(
+        models.User.username == form_data.username
+    ).first()
+
+    if not user or not verify_password(
+        form_data.password, user.hashed_password
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+        )
+    token = create_access_token(str(user.id))
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/auth/token")
+def get_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    user = db.query(models.User).filter(
+        models.User.username == form_data.username
+    ).first()
+
+    if not user or not verify_password(
+        form_data.password, user.hashed_password
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+        )
+
+    access_token = create_access_token(str(user.id))
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+    }
+
+@app.get("/auth/me", response_model=schemas.UserOut)
+def me(user=Depends(current_user)):
+    return user
+
+@app.get("/employees", response_model=list[schemas.EmployeeOut])
+def list_employees(search: str = "", department: str = "", db: Session = Depends(get_db),
+                   user=Depends(current_user)):
+    query = db.query(models.Employee)
+    if search:
+        query = query.filter(models.Employee.full_name.ilike(f"%{search}%"))
+    if department:
+        query = query.filter(models.Employee.department.ilike(f"%{department}%"))
+    return query.order_by(models.Employee.id.desc()).all()
+
+@app.post("/employees", response_model=schemas.EmployeeOut, status_code=201)
+def create_employee(data: schemas.EmployeeIn, db: Session = Depends(get_db),
+                    user=Depends(allow_roles("HR", "ADMIN"))):
+    if data.user_id and not db.query(models.User).filter(models.User.id == data.user_id).first():
+        raise HTTPException(status_code=404, detail="Linked user not found")
+    employee = models.Employee(**data.model_dump())
+    db.add(employee)
+    db.commit()
+    db.refresh(employee)
+    return employee
+
+@app.put("/employees/{employee_id}", response_model=schemas.EmployeeOut)
+def update_employee(employee_id: int, data: schemas.EmployeeIn, db: Session = Depends(get_db),
+                    user=Depends(allow_roles("HR", "ADMIN"))):
+    employee = db.query(models.Employee).filter(models.Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    for key, value in data.model_dump().items():
+        setattr(employee, key, value)
+    db.commit()
+    db.refresh(employee)
+    return employee
+
+@app.delete("/employees/{employee_id}", status_code=204)
+def delete_employee(employee_id: int, db: Session = Depends(get_db),
+                    user=Depends(allow_roles("HR", "ADMIN"))):
+    employee = db.query(models.Employee).filter(models.Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    db.delete(employee)
+    db.commit()
+    return None
+
+@app.get("/dashboard/summary")
+def dashboard_summary(db: Session = Depends(get_db), user=Depends(allow_roles("HR", "ADMIN"))):
+    total = db.query(models.Employee).count()
+    active = db.query(models.Employee).filter(models.Employee.status == "ACTIVE").count()
+    inactive = db.query(models.Employee).filter(models.Employee.status == "INACTIVE").count()
+    return {"total_employees": total, "active_employees": active,
+            "inactive_employees": inactive, "departments": db.query(models.Employee.department).distinct().count()}
+
+
+from datetime import datetime, date
+
+@app.post("/attendance/check-in")
+def check_in(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    today = date.today()
+    record = db.query(models.Attendance).filter(
+        models.Attendance.employee_id == employee.id,
+        models.Attendance.attendance_date == today
+    ).first()
+
+    if record and record.check_in:
+        raise HTTPException(
+            status_code=400,
+            detail="Already checked in today"
+        )
+
+    if not record:
+        record = models.Attendance(
+            employee_id=employee.id,
+            attendance_date=today,
+            check_in=datetime.now(),
+            status="PRESENT"
+        )
+        db.add(record)
+    else:
+        record.check_in = datetime.now()
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@app.post("/attendance/check-out")
+def check_out(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    record = db.query(models.Attendance).filter(
+        models.Attendance.employee_id == employee.id,
+        models.Attendance.attendance_date == date.today()
+    ).first()
+
+    if not record or not record.check_in:
+        raise HTTPException(
+            status_code=400,
+            detail="Please check in first"
+        )
+
+    if record.check_out:
+        raise HTTPException(
+            status_code=400,
+            detail="Already checked out today"
+        )
+
+    record.check_out = datetime.now()
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@app.get("/attendance")
+def list_attendance(
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    return db.query(models.Attendance).all()
+
+@app.get("/attendance/me")
+def my_attendance(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    return db.query(models.Attendance).filter(
+        models.Attendance.employee_id == employee.id
+    ).order_by(
+        models.Attendance.attendance_date.desc()
+    ).all()
+
+@app.get("/attendance/summary")
+def attendance_summary(
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    total_records = db.query(models.Attendance).count()
+
+    present_days = db.query(models.Attendance).filter(
+        models.Attendance.status == "PRESENT"
+    ).count()
+
+    absent_days = db.query(models.Attendance).filter(
+        models.Attendance.status == "ABSENT"
+    ).count()
+
+    return {
+        "total_attendance_records": total_records,
+        "present_days": present_days,
+        "absent_days": absent_days
+    }
+
+@app.get("/employees/me", response_model=schemas.EmployeeOut)
+def my_employee_profile(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    return employee
+
+@app.post("/leaves", status_code=201)
+def apply_leave(
+    start_date: date,
+    end_date: date,
+    reason: str,
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date cannot be before start date"
+        )
+
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    leave = models.Leave(
+        employee_id=employee.id,
+        start_date=start_date,
+        end_date=end_date,
+        reason=reason
+    )
+
+    db.add(leave)
+    db.commit()
+    db.refresh(leave)
+
+    return leave
+
+
+
+@app.get("/leaves")
+def get_my_leaves(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    leaves = db.query(models.Leave).filter(
+        models.Leave.employee_id == employee.id
+    ).order_by(models.Leave.id.desc()).all()
+
+    return leaves
+
+
+@app.put("/leaves/{leave_id}/status")
+def update_leave_status(
+    leave_id: int,
+    status: str,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    if status.upper() not in ["APPROVED", "REJECTED"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be APPROVED or REJECTED"
+        )
+
+    leave = db.query(models.Leave).filter(
+        models.Leave.id == leave_id
+    ).first()
+
+    if not leave:
+        raise HTTPException(
+            status_code=404,
+            detail="Leave request not found"
+        )
+
+    leave.status = status.upper()
+    db.commit()
+    db.refresh(leave)
+
+    return leave
+
+
+@app.get("/attendance/me")
+def my_attendance(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    return db.query(models.Attendance).filter(
+        models.Attendance.employee_id == employee.id
+    ).order_by(
+        models.Attendance.attendance_date.desc()
+    ).all()
+
+
+@app.get("/attendance/summary")
+def attendance_summary(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    records = db.query(models.Attendance).filter(
+        models.Attendance.employee_id == employee.id
+    ).all()
+
+    total_days = len(records)
+    present_days = sum(
+        1 for record in records
+        if record.status == "PRESENT"
+    )
+    absent_days = sum(
+        1 for record in records
+        if record.status == "ABSENT"
+    )
+
+    return {
+        "employee_id": employee.id,
+        "total_attendance_records": total_days,
+        "present_days": present_days,
+        "absent_days": absent_days
+    }
+
+@app.get("/employees/me", response_model=schemas.EmployeeOut)
+def my_employee_profile(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    return employee
+
+
+@app.post("/payroll", status_code=201)
+def create_payroll(
+    employee_id: int,
+    month: str,
+    basic_salary: float,
+    deductions: float = 0,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == employee_id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    if basic_salary < 0 or deductions < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Salary and deductions cannot be negative"
+        )
+
+    if deductions > basic_salary:
+        raise HTTPException(
+            status_code=400,
+            detail="Deductions cannot exceed basic salary"
+        )
+
+    payroll = models.Payroll(
+        employee_id=employee_id,
+        month=month,
+        basic_salary=basic_salary,
+        deductions=deductions,
+        net_salary=basic_salary - deductions,
+        payment_status="PENDING"
+    )
+
+    db.add(payroll)
+    db.commit()
+    db.refresh(payroll)
+
+    return payroll
+
+@app.get("/payroll")
+def get_payroll(
+    db: Session = Depends(get_db)
+):
+    return db.query(Payroll).all()
+
+
+@app.get("/payroll/{payroll_id}")
+def get_payroll_by_id(
+    payroll_id: int,
+    db: Session = Depends(get_db),
+   user = Depends(current_user)
+):
+    payroll = db.query(Payroll).filter(
+        Payroll.id == payroll_id
+    ).first()
+
+    if not payroll:
+        raise HTTPException(
+            status_code=404,
+            detail="Payroll record not found"
+        )
+
+    return payroll
+
+@app.get("/payroll/{payroll_id}")
+def get_payroll_by_id(
+    payroll_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    payroll = db.query(models.Payroll).filter(
+        models.Payroll.id == payroll_id
+    ).first()
+
+    if payroll is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Payroll record not found"
+        )
+
+    return payroll
+
+
+@app.put("/payroll/{payroll_id}/status")
+def update_payroll_status(
+    payroll_id: int,
+    status: str,
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    if status not in ["PAID", "PENDING"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be PAID or PENDING"
+        )
+
+    payroll = db.query(models.Payroll).filter(
+        models.Payroll.id == payroll_id
+    ).first()
+
+    if payroll is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Payroll record not found"
+        )
+
+    payroll.payment_status = status
+    db.commit()
+    db.refresh(payroll)
+
+    return payroll
