@@ -1,7 +1,8 @@
 from datetime import datetime, date
 from sqlalchemy import Column, Integer, String, Date, DateTime, Float, ForeignKey
 from .database import Base
-
+from sqlalchemy import Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 
 class User(Base):
     __tablename__ = "users"
@@ -17,6 +18,7 @@ class Employee(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, unique=True)
     full_name = Column(String(150), nullable=False)
+    email = Column(String(255), nullable=True)
     designation = Column(String(100), default="")
     department = Column(String(100), default="")
     joining_date = Column(Date, nullable=True)
@@ -73,3 +75,13 @@ class Payroll(Base):
         DateTime,
         default=datetime.utcnow
     )
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(150), nullable=False)
+    message = Column(String(500), nullable=False)
+    is_read = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)

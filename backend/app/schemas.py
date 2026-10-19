@@ -27,12 +27,40 @@ class TokenOut(BaseModel):
 class EmployeeIn(BaseModel):
     user_id: int | None = None
     full_name: str = Field(min_length=1, max_length=150)
+    email: EmailStr | None = None
     designation: str = ""
     department: str = ""
     joining_date: date | None = None
     salary: float = Field(default=0, ge=0)
     status: str = "ACTIVE"
 
-class EmployeeOut(EmployeeIn):
+class EmployeeOut(BaseModel):
     id: int
+    user_id: int | None = None
+    full_name: str
+    email: str | None = None
+    designation: str | None = None
+    department: str | None = None
+    joining_date: date | None = None
+    salary: float = 0
+    status: str = "ACTIVE"
+
+    class Config:
+        from_attributes = True
+
+class LeaveIn(BaseModel):
+    start_date: date
+    end_date: date
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class LeaveOut(BaseModel):
+    id: int
+    employee_id: int
+    start_date: date
+    end_date: date
+    reason: str
+    status: str
+    created_at: datetime
+
     model_config = ConfigDict(from_attributes=True)
