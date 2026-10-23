@@ -31,20 +31,22 @@ def verify_password(password: str, hashed_password: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-def create_access_token(subject: str) -> str:
+
+def create_access_token(subject: str, role: str = "EMPLOYEE") -> str:
     expires = datetime.now(timezone.utc) + timedelta(
         minutes=ACCESS_TOKEN_EXPIRE_MINUTES
     )
 
     payload = {
         "sub": subject,
-        "exp": expires
+        "role": role,
+        "exp": expires,
     }
 
     return jwt.encode(
         payload,
         SECRET_KEY,
-        algorithm=ALGORITHM
+        algorithm=ALGORITHM,
     )
 
 

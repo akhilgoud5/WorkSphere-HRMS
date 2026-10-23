@@ -41,20 +41,10 @@ class Attendance(Base):
     status = Column(String(20), default="PRESENT")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+ 
 class Leave(Base):
     __tablename__ = "leaves"
-
-    id = Column(Integer, primary_key=True, index=True)
-    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False)
-    start_date = Column(Date, nullable=False)
-    end_date = Column(Date, nullable=False)
-    reason = Column(String, nullable=False)
-    status = Column(String, default="PENDING")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    
-class Payroll(Base):
-    __tablename__ = "payrolls"
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(
@@ -62,19 +52,46 @@ class Payroll(Base):
         ForeignKey("employees.id"),
         nullable=False
     )
+    policy_id = Column(
+        Integer,
+        ForeignKey("leave_policies.id"),
+        nullable=True
+    )
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    reason = Column(String, nullable=False)
+    status = Column(String, default="PENDING")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+
+class Payroll(Base):
+    __tablename__ = "payrolls"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id"),
+        nullable=False
+    )
+
     month = Column(String(20), nullable=False)
     basic_salary = Column(Float, nullable=False)
-    deductions = Column(Float, default=0.0)
+    allowances = Column(Float, default=0.0, nullable=False)
+    deductions = Column(Float, default=0.0, nullable=False)
     net_salary = Column(Float, nullable=False)
+
     payment_status = Column(
         String(20),
         default="PENDING",
         nullable=False
     )
+
     created_at = Column(
         DateTime,
         default=datetime.utcnow
     )
+
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -85,3 +102,31 @@ class Notification(Base):
     message = Column(String(500), nullable=False)
     is_read = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class LeavePolicy(Base):
+    __tablename__ = "leave_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, unique=True)
+    annual_days = Column(Integer, nullable=False, default=12)
+    description = Column(String(255), default="")
+    is_active = Column(Boolean, default=True)
+
+
+class LeaveBalance(Base):
+    __tablename__ = "leave_balances"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id"),
+        nullable=False
+    )
+    policy_id = Column(
+        Integer,
+        ForeignKey("leave_policies.id"),
+        nullable=False
+    )
+    year = Column(Integer, nullable=False)
+    allocated_days = Column(Integer, nullable=False, default=12)
+    used_days = Column(Integer, nullable=False, default=0) 

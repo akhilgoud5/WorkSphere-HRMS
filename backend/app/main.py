@@ -1,13 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 from .database import Base, engine, get_db
-from . import models, schemas
 from .security import hash_password, verify_password, create_access_token
 from .dependencies import current_user, allow_roles
 from datetime import datetime, date
 from fastapi.security import OAuth2PasswordRequestForm
 from .models import Payroll
+from . import models, schemas
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="WorkSphere HRMS API", version="1.0.0",
@@ -70,8 +71,10 @@ def login(
             detail="Incorrect username or password",
         )
 
-    token = create_access_token(str(user.id))
-
+    token = create_access_token(
+    subject=str(user.id),
+    role=user.role,
+)
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -82,6 +85,7 @@ def login(
             "role": user.role,
         },
     }
+
 
 
 @app.post("/auth/token")
@@ -101,12 +105,16 @@ def get_token(
             detail="Incorrect username or password",
         )
 
-    access_token = create_access_token(str(user.id))
+    access_token = create_access_token(
+        subject=str(user.id),
+        role=user.role,
+    )
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
     }
+
 
 @app.get("/auth/me", response_model=schemas.UserOut)
 def me(user=Depends(current_user)):
@@ -440,15 +448,21 @@ def list_employees(
 
     return results
 
+
+class LeaveCreate(BaseModel):
+    start_date: date
+    end_date: date
+    reason: str
+    policy_id: int
+
+
 @app.post("/leaves", status_code=201)
 def apply_leave(
-    start_date: date,
-    end_date: date,
-    reason: str,
+    leave_data: LeaveCreate,
     db: Session = Depends(get_db),
     user=Depends(current_user)
 ):
-    if end_date < start_date:
+    if leave_data.end_date < leave_data.start_date:
         raise HTTPException(
             status_code=400,
             detail="End date cannot be before start date"
@@ -464,11 +478,24 @@ def apply_leave(
             detail="Employee profile not found"
         )
 
+    policy = db.query(models.LeavePolicy).filter(
+        models.LeavePolicy.id == leave_data.policy_id,
+        models.LeavePolicy.is_active == True
+    ).first()
+
+    if not policy:
+        raise HTTPException(
+            status_code=404,
+            detail="Active leave policy not found"
+        )
+
     leave = models.Leave(
         employee_id=employee.id,
-        start_date=start_date,
-        end_date=end_date,
-        reason=reason
+        policy_id=policy.id,
+        start_date=leave_data.start_date,
+        end_date=leave_data.end_date,
+        reason=leave_data.reason,
+        status="PENDING"
     )
 
     db.add(leave)
@@ -501,6 +528,7 @@ def get_my_leaves(
     return leaves
 
 
+
 @app.put("/leaves/{leave_id}/status")
 def update_leave_status(
     leave_id: int,
@@ -508,7 +536,9 @@ def update_leave_status(
     db: Session = Depends(get_db),
     user=Depends(allow_roles("HR", "ADMIN"))
 ):
-    if status.upper() not in ["APPROVED", "REJECTED"]:
+    new_status = status.upper()
+
+    if new_status not in ["APPROVED", "REJECTED"]:
         raise HTTPException(
             status_code=400,
             detail="Status must be APPROVED or REJECTED"
@@ -524,7 +554,40 @@ def update_leave_status(
             detail="Leave request not found"
         )
 
-    leave.status = status.upper()
+    # Do not deduct balance twice
+    if leave.status == "APPROVED":
+        if new_status == "REJECTED":
+            raise HTTPException(
+                status_code=400,
+                detail="An approved leave cannot be rejected directly"
+            )
+        return leave
+
+    if new_status == "APPROVED":
+        leave_days = (leave.end_date - leave.start_date).days + 1
+
+        balance = db.query(models.LeaveBalance).filter(
+            models.LeaveBalance.employee_id == leave.employee_id,
+            models.LeaveBalance.year == leave.start_date.year
+        ).first()
+
+        if not balance:
+            raise HTTPException(
+                status_code=404,
+                detail="Leave balance not found for this employee and year"
+            )
+
+        remaining_days = balance.allocated_days - balance.used_days
+
+        if remaining_days < leave_days:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient leave balance"
+            )
+
+        balance.used_days += leave_days
+
+    leave.status = new_status
     db.commit()
     db.refresh(leave)
 
@@ -568,11 +631,14 @@ def attendance_summary(
     }
 
 
+
+
 @app.post("/payroll", status_code=201)
 def create_payroll(
     employee_id: int,
     month: str,
     basic_salary: float,
+    allowances: float = 0,
     deductions: float = 0,
     db: Session = Depends(get_db),
     user=Depends(allow_roles("HR", "ADMIN"))
@@ -587,24 +653,27 @@ def create_payroll(
             detail="Employee not found"
         )
 
-    if basic_salary < 0 or deductions < 0:
+    if basic_salary < 0 or allowances < 0 or deductions < 0:
         raise HTTPException(
             status_code=400,
-            detail="Salary and deductions cannot be negative"
+            detail="Salary, allowances, and deductions cannot be negative"
         )
 
-    if deductions > basic_salary:
+    gross_salary = basic_salary + allowances
+
+    if deductions > gross_salary:
         raise HTTPException(
             status_code=400,
-            detail="Deductions cannot exceed basic salary"
+            detail="Deductions cannot exceed gross salary"
         )
 
     payroll = models.Payroll(
         employee_id=employee_id,
         month=month,
         basic_salary=basic_salary,
+        allowances=allowances,
         deductions=deductions,
-        net_salary=basic_salary - deductions,
+        net_salary=gross_salary - deductions,
         payment_status="PENDING"
     )
 
@@ -614,21 +683,52 @@ def create_payroll(
 
     return payroll
 
+
+
+  
 @app.get("/payroll")
 def get_payroll(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
 ):
-    return db.query(Payroll).all()
+    return db.query(models.Payroll).all()
+
+
+@app.get("/payroll/summary")
+def payroll_summary(
+    month: str,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    records = db.query(models.Payroll).filter(
+        models.Payroll.month == month
+    ).all()
+
+    paid_records = [
+        p for p in records if p.payment_status == "PAID"
+    ]
+    pending_records = [
+        p for p in records if p.payment_status == "PENDING"
+    ]
+
+    return {
+        "month": month,
+        "total_payroll_records": len(records),
+        "paid_payroll_records": len(paid_records),
+        "pending_payroll_records": len(pending_records),
+        "total_paid_salary": sum(p.net_salary for p in paid_records),
+        "total_net_payroll_amount": sum(p.net_salary for p in records)
+    }
 
 
 @app.get("/payroll/{payroll_id}")
 def get_payroll_by_id(
     payroll_id: int,
     db: Session = Depends(get_db),
-   user = Depends(current_user)
+    user=Depends(current_user)
 ):
-    payroll = db.query(Payroll).filter(
-        Payroll.id == payroll_id
+    payroll = db.query(models.Payroll).filter(
+        models.Payroll.id == payroll_id
     ).first()
 
     if not payroll:
@@ -645,7 +745,7 @@ def update_payroll_status(
     payroll_id: int,
     status: str,
     db: Session = Depends(get_db),
-    user=Depends(current_user)
+    user=Depends(allow_roles("HR", "ADMIN"))
 ):
     if status not in ["PAID", "PENDING"]:
         raise HTTPException(
@@ -668,6 +768,7 @@ def update_payroll_status(
     db.refresh(payroll)
 
     return payroll
+
 
 
 @app.post("/auth/create-hr")
@@ -705,6 +806,7 @@ def create_hr_account(
         "role": hr_user.role
     }
 
+
 @app.get("/admin/analytics")
 def admin_analytics(
     db: Session = Depends(get_db),
@@ -718,10 +820,14 @@ def admin_analytics(
     ).count()
 
     total_attendance = db.query(models.Attendance).count()
-    total_leaves = db.query(models.Leave).count()
 
+    total_leaves = db.query(models.Leave).count()
     pending_leaves = db.query(models.Leave).filter(
         models.Leave.status == "PENDING"
+    ).count()
+
+    approved_leaves = db.query(models.Leave).filter(
+        models.Leave.status == "APPROVED"
     ).count()
 
     total_payroll = db.query(models.Payroll).count()
@@ -730,14 +836,26 @@ def admin_analytics(
         models.Payroll.payment_status == "PAID"
     ).count()
 
-    total_payroll_amount = db.query(
+    pending_payroll = db.query(models.Payroll).filter(
+        models.Payroll.payment_status == "PENDING"
+    ).count()
+
+    paid_amount = db.query(
         models.Payroll.net_salary
     ).filter(
         models.Payroll.payment_status == "PAID"
     ).all()
 
-    paid_amount = sum(
-        float(row[0] or 0) for row in total_payroll_amount
+    total_paid_salary = sum(
+        float(row[0] or 0) for row in paid_amount
+    )
+
+    total_net_payroll = db.query(
+        models.Payroll.net_salary
+    ).all()
+
+    total_payroll_amount = sum(
+        float(row[0] or 0) for row in total_net_payroll
     )
 
     return {
@@ -747,10 +865,15 @@ def admin_analytics(
         "total_attendance_records": total_attendance,
         "total_leave_requests": total_leaves,
         "pending_leave_requests": pending_leaves,
+        "approved_leave_requests": approved_leaves,
         "total_payroll_records": total_payroll,
         "paid_payroll_records": paid_payroll,
-        "total_paid_salary": paid_amount
+        "pending_payroll_records": pending_payroll,
+        "total_paid_salary": total_paid_salary,
+        "total_net_payroll_amount": total_payroll_amount
     }
+
+
 
 @app.get("/notifications")
 def get_notifications(
@@ -942,9 +1065,203 @@ def update_leave_status(
     db.refresh(leave)
     return leave 
 
+class LeavePolicyCreate(BaseModel):
+    name: str
+    annual_days: int
+    description: str = ""
 
 
+@app.post("/leave-policies", status_code=201)
+def create_leave_policy(
+    policy_data: LeavePolicyCreate,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    if policy_data.annual_days <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Annual leave days must be greater than zero"
+        )
+
+    existing = db.query(models.LeavePolicy).filter(
+        models.LeavePolicy.name == policy_data.name
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Leave policy already exists"
+        )
+
+    policy = models.LeavePolicy(
+        name=policy_data.name,
+        annual_days=policy_data.annual_days,
+        description=policy_data.description
+    )
+
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+
+    return policy
+
+class LeaveBalanceCreate(BaseModel):
+    employee_id: int
+    policy_id: int
+    year: int
+    allocated_days: int
+
+
+@app.post("/leave-balances", status_code=201)
+def create_leave_balance(
+    balance_data: LeaveBalanceCreate,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == balance_data.employee_id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    policy = db.query(models.LeavePolicy).filter(
+        models.LeavePolicy.id == balance_data.policy_id,
+        models.LeavePolicy.is_active == True
+    ).first()
+
+    if not policy:
+        raise HTTPException(
+            status_code=404,
+            detail="Active leave policy not found"
+        )
+
+    if balance_data.allocated_days < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Allocated days cannot be negative"
+        )
+
+    existing = db.query(models.LeaveBalance).filter(
+        models.LeaveBalance.employee_id == balance_data.employee_id,
+        models.LeaveBalance.policy_id == balance_data.policy_id,
+        models.LeaveBalance.year == balance_data.year
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Leave balance already exists for this employee, policy, and year"
+        )
+
+    balance = models.LeaveBalance(
+        employee_id=balance_data.employee_id,
+        policy_id=balance_data.policy_id,
+        year=balance_data.year,
+        allocated_days=balance_data.allocated_days,
+        used_days=0
+    )
+
+    db.add(balance)
+    db.commit()
+    db.refresh(balance)
+
+    return balance
+  
+@app.get("/leave-balances/{employee_id}")
+def get_leave_balance(
+    employee_id: int,
+    year: int,
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    # Employees can view only their own balances.
+    if user.role not in ["HR", "ADMIN"]:
+        employee = db.query(models.Employee).filter(
+            models.Employee.user_id == user.id
+        ).first()
+
+        if not employee or employee.id != employee_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only view your own leave balance"
+            )
+
+    balances = db.query(models.LeaveBalance).filter(
+        models.LeaveBalance.employee_id == employee_id,
+        models.LeaveBalance.year == year
+    ).all()
+
+    return [
+        {
+            "id": balance.id,
+            "employee_id": balance.employee_id,
+            "policy_id": balance.policy_id,
+            "year": balance.year,
+            "allocated_days": balance.allocated_days,
+            "used_days": balance.used_days,
+            "remaining_days": balance.allocated_days - balance.used_days
+        }
+        for balance in balances
+    ]
 
   
+@app.put("/admin/users/{user_id}/role")
+def update_user_role(
+    user_id: int,
+    role: str,
+    db: Session = Depends(get_db),
+    admin=Depends(allow_roles("ADMIN"))
+):
+    allowed_roles = ["ADMIN", "HR", "EMPLOYEE"]
+
+    role = role.upper()
+
+    if role not in allowed_roles:
+        raise HTTPException(
+            status_code=400,
+            detail="Role must be ADMIN, HR, or EMPLOYEE"
+        )
+
+    user = db.query(models.User).filter(
+        models.User.id == user_id
+    ).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    user.role = role
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "message": "User role updated successfully",
+        "user_id": user.id,
+        "username": user.username,
+        "role": user.role
+    }
 
   
+@app.get("/admin/users")
+def get_admin_users(
+    db: Session = Depends(get_db),
+    admin=Depends(allow_roles("ADMIN"))
+):
+    users = db.query(models.User).all()
+
+    return [
+        {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": user.role
+        }
+        for user in users
+    ]
+
