@@ -457,28 +457,35 @@ async function updatePayrollStatus(id, status) {
 }
 
 
-  async function applyLeave(e) {
-    e.preventDefault();
-    setLeaveMessage("");
 
-    try {
-      const params = new URLSearchParams(leaveForm);
 
-      await api.post(`/leaves?${params.toString()}`);
+async function applyLeave(e) {
+  e.preventDefault();
+  setLeaveMessage("");
 
-      setLeaveMessage("Leave application submitted successfully.");
+  try {
+    await api.post("/leaves", {
+      start_date: leaveForm.start_date,
+      end_date: leaveForm.end_date,
+      reason: leaveForm.reason,
+      policy_id: Number(leaveForm.policy_id),
+    });
 
-      setLeaveForm({
-        start_date: "",
-        end_date: "",
-        reason: "",
-      });
+    setLeaveMessage("Leave application submitted successfully.");
 
-      await loadLeaves();
-    } catch (err) {
-      setLeaveMessage(getErrorMessage(err));
-    }
+    setLeaveForm({
+      start_date: "",
+      end_date: "",
+      reason: "",
+      policy_id: "",
+    });
+
+    await loadLeaves();
+  } catch (err) {
+    setLeaveMessage(getErrorMessage(err));
   }
+}
+
 
   async function updateLeaveStatus(id, status) {
     try {
