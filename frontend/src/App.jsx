@@ -394,6 +394,24 @@ const [payrollMessage, setPayrollMessage] = useState("");
     }
   }
 
+async function updateLeaveStatus(leaveId, status) {
+  try {
+    await api.patch(`/leaves/${leaveId}/status`, null, {
+      params: {
+        status: status,
+      },
+    });
+
+    setLeaveMessage(
+      `Leave ${status.toLowerCase()} successfully.`
+    );
+
+    await loadLeaves();
+  } catch (err) {
+    setLeaveMessage(getErrorMessage(err));
+  }
+}
+
   
 async function loadPayroll() {
   try {
@@ -457,19 +475,24 @@ async function updatePayrollStatus(id, status) {
 }
 
 
-
-
 async function applyLeave(e) {
   e.preventDefault();
   setLeaveMessage("");
 
   try {
-    await api.post("/leaves", {
+    if (!leaveForm.policy_id) {
+      setLeaveMessage("Please select a leave policy.");
+      return;
+    }
+
+    const payload = {
       start_date: leaveForm.start_date,
       end_date: leaveForm.end_date,
       reason: leaveForm.reason,
       policy_id: Number(leaveForm.policy_id),
-    });
+    };
+
+    await api.post("/leaves", payload);
 
     setLeaveMessage("Leave application submitted successfully.");
 
@@ -486,22 +509,6 @@ async function applyLeave(e) {
   }
 }
 
-
-  async function updateLeaveStatus(id, status) {
-    try {
-      await api.put(
-        `/leaves/${id}/status?status=${encodeURIComponent(status)}`
-      );
-
-      setLeaveMessage(
-        `Leave ${status.toLowerCase()} successfully.`
-      );
-
-      await loadLeaves();
-    } catch (err) {
-      setLeaveMessage(getErrorMessage(err));
-    }
-  }
 
   // Notifications
 
@@ -564,31 +571,24 @@ async function applyLeave(e) {
         <h2>▣ WorkSphere</h2>
         <p className="sidebar-caption">HUMAN RESOURCES</p>
 
-        {[
-          "Overview",
-          "Employees",
-          "Attendance",
-          "Leaves",
-          "Payroll",
-          "Notifications",
-        ].map((name) => (
-          <button
-            key={name}
-            className={
-              page === name ? "nav-item active" : "nav-item"
-            }
-            onClick={() => openPage(name)}
-          >
-            {name}
-
-            {name === "Notifications" &&
-              notifications.some((item) => !item.is_read) && (
-                <span className="notification-count">
-                  {notifications.filter((item) => !item.is_read).length}
-                </span>
-              )}
-          </button>
-        ))}
+        
+{[
+  "Overview",
+  "Employees",
+  "Attendance",
+  "Leaves",
+  "Payroll",
+  "Notifications",
+  "Admin",
+].map((name) => (
+  <button
+    key={name}
+    className={`nav-item ${page === name ? "active" : ""}`}
+    onClick={() => openPage(name)}
+  >
+    {name}
+  </button>
+))}
 
         <div className="sidebar-bottom">
           <p>{user?.username || user?.name || "Employee"}</p>
@@ -866,17 +866,35 @@ async function applyLeave(e) {
                   />
                 </label>
 
-                <input
-                  placeholder="Reason for leave"
-                  value={leaveForm.reason}
-                  onChange={(e) =>
-                    setLeaveForm({
-                      ...leaveForm,
-                      reason: e.target.value,
-                    })
-                  }
-                  required
-                />
+                
+<label>
+  Leave Policy
+  <select
+    value={leaveForm.policy_id}
+    onChange={(e) =>
+      setLeaveForm({
+        ...leaveForm,
+        policy_id: e.target.value,
+      })
+    }
+    required
+  >
+    <option value="">Select Leave Policy</option>
+    <option value="4">Casual Leave</option>
+  </select>
+</label>
+
+<input
+  placeholder="Reason for leave"
+  value={leaveForm.reason}
+  onChange={(e) =>
+    setLeaveForm({
+      ...leaveForm,
+      reason: e.target.value,
+    })
+  }
+  required
+/>
 
                 <button type="submit">Submit Leave</button>
               </form>
@@ -1162,10 +1180,40 @@ async function applyLeave(e) {
             )}
           </section>
         )}
+                {/* ADMIN */}
+        {page === "Admin" && (
+          <section className="panel">
+            <h2>Admin Dashboard</h2>
+            <p>Manage users, roles, and HRMS analytics.</p>
+
+            <div className="stats-grid">
+              <div className="stat-card">
+                <h3>Total Employees</h3>
+                <p>{employees.length}</p>
+              </div>
+
+              <div className="stat-card">
+                <h3>Pending Leaves</h3>
+                <p>
+                  {leaves.filter(
+                    (leave) =>
+                      String(leave.status).toUpperCase() === "PENDING"
+                  ).length}
+                </p>
+              </div>
+
+              <div className="stat-card">
+                <h3>Payroll Records</h3>
+                <p>{payroll.length}</p>
+              </div>
+            </div>
+          </section>
+        )}
       </main>
-    </div>
-  );
-}
+      </div>
+     );
+   }
+
 
 // ---------------- APP ENTRY ----------------
 
