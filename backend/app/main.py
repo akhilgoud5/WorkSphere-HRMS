@@ -9,10 +9,51 @@ from datetime import datetime, date
 from fastapi.security import OAuth2PasswordRequestForm
 from .models import Payroll
 from . import models, schemas
+from .shift_routes import router as shift_router
+from app.schemas import LeaveIn
+from datetime import date, datetime
+from fastapi import Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.schemas import LeaveBalanceCreate
+from app.routers import documents
+from app.routers import performance
+from app import models
+from app.routers import notifications
+from app.models import User, Employee, Leave
+from app.routers import analytics
+from datetime import datetime, timedelta
+from app.models import Notification
 
-Base.metadata.create_all(bind=engine)
 app = FastAPI(title="WorkSphere HRMS API", version="1.0.0",
               description="Starter API for WorkSphere HR Management System")
+Base.metadata.create_all(bind=engine)
+
+from sqlalchemy import inspect, text
+
+# Add the missing shift_id column to the existing attendance table
+inspector = inspect(engine)
+
+if "attendance" in inspector.get_table_names():
+    columns = [
+        column["name"]
+        for column in inspector.get_columns("attendance")
+    ]
+
+    if "shift_id" not in columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE attendance "
+                    "ADD COLUMN shift_id INTEGER REFERENCES shifts(id)"
+                )
+            )
+        print("Migration successful: shift_id added to attendance.")
+
+app.include_router(shift_router)
+app.include_router(documents.router)
+app.include_router(performance.router)
+app.include_router(notifications.router)
+app.include_router(analytics.router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -173,6 +214,7 @@ def create_employee(
 def list_employees(
     search: str = "",
     department: str = "",
+    status: str = "",
     db: Session = Depends(get_db),
     user=Depends(current_user),
 ):
@@ -188,18 +230,24 @@ def list_employees(
             models.Employee.department.ilike(f"%{department}%")
         )
 
-    employees = query.order_by(models.Employee.id.desc()).all()
+    if status:
+        query = query.filter(
+            models.Employee.status.ilike(f"%{status}%")
+        )
+
+    employees = query.order_by(
+        models.Employee.id.desc()
+    ).all()
+
     results = []
 
     for employee in employees:
-        employee_data = schemas.EmployeeOut.model_validate(
-            employee
-        ).model_dump()
+        employee_data = (
+            schemas.EmployeeOut.model_validate(employee).model_dump()
+        )
 
-        # Prefer the email saved directly on the employee.
         email = employee.email
 
-        # Use the linked user's email only if the employee email is empty.
         if not email and employee.user_id is not None:
             linked_user = db.query(models.User).filter(
                 models.User.id == employee.user_id
@@ -278,11 +326,78 @@ def dashboard_summary(
     }
 
 
+@app.get("/analytics/attendance")
+def attendance_analytics(
+    report_date: date = None,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    from sqlalchemy import func
+
+    selected_date = report_date or date.today()
+
+    total_records = db.query(models.Attendance).filter(
+        models.Attendance.attendance_date == selected_date
+    ).count()
+
+    present = db.query(models.Attendance).filter(
+        models.Attendance.attendance_date == selected_date,
+        models.Attendance.status == "PRESENT"
+    ).count()
+
+    absent = db.query(models.Attendance).filter(
+        models.Attendance.attendance_date == selected_date,
+        models.Attendance.status == "ABSENT"
+    ).count()
+
+    late = db.query(models.Attendance).filter(
+        models.Attendance.attendance_date == selected_date,
+        func.upper(models.Attendance.status).like("%LATE%")
+    ).count()
+
+    return {
+        "report_date": selected_date.isoformat(),
+        "total_attendance_records": total_records,
+        "present": present,
+        "absent": absent,
+        "late": late
+    }
+
+@app.get("/analytics/leaves")
+def leave_analytics(
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    total = db.query(models.Leave).count()
+
+    pending = db.query(models.Leave).filter(
+        models.Leave.status == "PENDING"
+    ).count()
+
+    approved = db.query(models.Leave).filter(
+        models.Leave.status == "APPROVED"
+    ).count()
+
+    rejected = db.query(models.Leave).filter(
+        models.Leave.status == "REJECTED"
+    ).count()
+
+    return {
+        "total_leave_requests": total,
+        "pending": pending,
+        "approved": approved,
+        "rejected": rejected
+    }
+
 @app.post("/attendance/check-in")
 def check_in(
     db: Session = Depends(get_db),
     user=Depends(current_user)
 ):
+    now = datetime.now()
+    today = now.date()
+
+    # 1. Find employee profile
     employee = db.query(models.Employee).filter(
         models.Employee.user_id == user.id
     ).first()
@@ -293,7 +408,7 @@ def check_in(
             detail="Employee profile not found"
         )
 
-    today = date.today()
+    # 2. Find today's attendance record
     record = db.query(models.Attendance).filter(
         models.Attendance.employee_id == employee.id,
         models.Attendance.attendance_date == today
@@ -305,19 +420,61 @@ def check_in(
             detail="Already checked in today"
         )
 
+    # 3. Find the employee's assigned shift
+    assignment = db.query(models.EmployeeShift).filter(
+        models.EmployeeShift.employee_id == employee.id
+    ).first()
+
+    shift = None
+
+    if assignment:
+        shift = db.query(models.Shift).filter(
+            models.Shift.id == assignment.shift_id
+        ).first()
+
+    # 4. Determine attendance status
+    status = "PRESENT"
+
+    if shift:
+         shift_start = shift.start_time
+
+    if isinstance(shift_start, str):
+        shift_start = datetime.strptime(
+            shift_start, "%H:%M:%S"
+        ).time()
+
+    shift_start_datetime = datetime.combine(
+        today, shift_start
+    )
+    grace_period = timedelta(minutes=5)
+
+    if now > shift_start_datetime + grace_period:
+        status = "LATE"
+
+    # 5. Create or update attendance
     if not record:
         record = models.Attendance(
             employee_id=employee.id,
             attendance_date=today,
-            check_in=datetime.now(),
-            status="PRESENT"
+            check_in=now,
+            status=status
         )
+
+        if hasattr(record, "shift_id") and shift:
+            record.shift_id = shift.id
+
         db.add(record)
+
     else:
-        record.check_in = datetime.now()
+        record.check_in = now
+        record.status = status
+
+        if hasattr(record, "shift_id") and shift:
+            record.shift_id = shift.id
 
     db.commit()
     db.refresh(record)
+
     return record
 
 
@@ -326,6 +483,10 @@ def check_out(
     db: Session = Depends(get_db),
     user=Depends(current_user)
 ):
+    now = datetime.now()
+    today = now.date()
+
+    # 1. Find employee profile
     employee = db.query(models.Employee).filter(
         models.Employee.user_id == user.id
     ).first()
@@ -336,9 +497,10 @@ def check_out(
             detail="Employee profile not found"
         )
 
+    # 2. Find today's attendance
     record = db.query(models.Attendance).filter(
         models.Attendance.employee_id == employee.id,
-        models.Attendance.attendance_date == date.today()
+        models.Attendance.attendance_date == today
     ).first()
 
     if not record or not record.check_in:
@@ -353,11 +515,37 @@ def check_out(
             detail="Already checked out today"
         )
 
-    record.check_out = datetime.now()
+    # 3. Find assigned shift
+    assignment = db.query(models.EmployeeShift).filter(
+        models.EmployeeShift.employee_id == employee.id
+    ).first()
+
+    shift = None
+
+    if assignment:
+        shift = db.query(models.Shift).filter(
+            models.Shift.id == assignment.shift_id
+        ).first()
+
+    # 4. Record check-out
+    record.check_out = now
+
+    # Preserve LATE status if the employee checked in late.
+    if shift and record.status != "LATE":
+        shift_end = shift.end_time
+
+        if isinstance(shift_end, str):
+            shift_end = datetime.strptime(
+                shift_end, "%H:%M:%S"
+            ).time()
+
+        if now.time() < shift_end:
+            record.status = "EARLY_CHECKOUT"
+
     db.commit()
     db.refresh(record)
-    return record
 
+    return record
 
 @app.get("/attendance")
 def list_attendance(
@@ -409,65 +597,12 @@ def attendance_summary(
     }
 
 
-@app.get("/employees", response_model=list[schemas.EmployeeOut])
-def list_employees(
-    search: str = "",
-    department: str = "",
-    db: Session = Depends(get_db),
-    user=Depends(current_user),
-):
-    query = db.query(models.Employee)
-
-    if search:
-        query = query.filter(
-            models.Employee.full_name.ilike(f"%{search}%")
-        )
-
-    if department:
-        query = query.filter(
-            models.Employee.department.ilike(f"%{department}%")
-        )
-
-    employees = query.order_by(models.Employee.id.desc()).all()
-
-    results = []
-
-    for employee in employees:
-        employee_data = schemas.EmployeeOut.model_validate(employee).model_dump()
-
-        linked_user = None
-        if employee.user_id is not None:
-            linked_user = (
-                db.query(models.User)
-                .filter(models.User.id == employee.user_id)
-                .first()
-            )
-
-        employee_data["email"] = linked_user.email if linked_user else None
-        results.append(employee_data)
-
-    return results
-
-
-class LeaveCreate(BaseModel):
-    start_date: date
-    end_date: date
-    reason: str
-    policy_id: int
-
-
 @app.post("/leaves", status_code=201)
 def apply_leave(
-    leave_data: LeaveCreate,
+    leave_data: LeaveIn,
     db: Session = Depends(get_db),
     user=Depends(current_user)
 ):
-    if leave_data.end_date < leave_data.start_date:
-        raise HTTPException(
-            status_code=400,
-            detail="End date cannot be before start date"
-        )
-
     employee = db.query(models.Employee).filter(
         models.Employee.user_id == user.id
     ).first()
@@ -478,6 +613,272 @@ def apply_leave(
             detail="Employee profile not found"
         )
 
+    if leave_data.start_date > leave_data.end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Start date cannot be after end date"
+        )
+
+    # Validate the leave policy if provided
+    if leave_data.policy_id is not None:
+        policy = db.query(models.LeavePolicy).filter(
+            models.LeavePolicy.id == leave_data.policy_id,
+            models.LeavePolicy.is_active == True
+        ).first()
+
+        if not policy:
+            raise HTTPException(
+                status_code=404,
+                detail="Active leave policy not found"
+            )
+
+    leave = models.Leave(
+        employee_id=employee.id,
+        policy_id=leave_data.policy_id,
+        start_date=leave_data.start_date,
+        end_date=leave_data.end_date,
+        reason=leave_data.reason,
+        status="PENDING"
+    )
+
+    db.add(leave)
+    db.commit()
+    db.refresh(leave)
+
+    return leave
+
+
+@app.get("/leaves/me")
+def my_leaves(
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    return db.query(models.Leave).filter(
+        models.Leave.employee_id == employee.id
+    ).order_by(
+        models.Leave.created_at.desc()
+    ).all()
+
+
+@app.put("/leaves/{leave_id}/approve")
+def approve_leave(
+    leave_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    # 1. Find the leave request
+    leave = db.query(models.Leave).filter(
+        models.Leave.id == leave_id
+    ).first()
+
+    if not leave:
+        raise HTTPException(
+            status_code=404,
+            detail="Leave request not found"
+        )
+
+    # 2. Check leave status
+    if leave.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail="Leave request has already been processed"
+        )
+
+    # 3. Validate leave dates
+    if leave.end_date < leave.start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date cannot be before start date"
+        )
+
+    # 4. A policy must be selected before deducting leave
+    if leave.policy_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This leave request has no leave policy assigned"
+        )
+
+    # 5. Calculate requested days (calendar days, including both dates)
+    requested_days = (
+        leave.end_date - leave.start_date
+    ).days + 1
+
+    # 6. Find the matching yearly leave balance
+    leave_year = leave.start_date.year
+
+    balance = db.query(models.LeaveBalance).filter(
+        models.LeaveBalance.employee_id == leave.employee_id,
+        models.LeaveBalance.policy_id == leave.policy_id,
+        models.LeaveBalance.year == leave_year
+    ).first()
+
+    if not balance:
+        raise HTTPException(
+            status_code=404,
+            detail="Leave balance not found for this employee, policy, and year"
+        )
+
+    # 7. Check remaining days
+    remaining_days = balance.allocated_days - balance.used_days
+
+    if requested_days > remaining_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient leave balance. Remaining days: {remaining_days}"
+        )
+
+        # 8. Update balance and approve the request
+    try:
+        balance.used_days += requested_days
+        leave.status = "APPROVED"
+        db.commit()
+        db.refresh(leave)
+        db.refresh(balance)
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to approve leave and update balance"
+        )
+
+    # 9. Notify the employee
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == leave.employee_id
+    ).first()
+
+    if employee and employee.user_id:
+        try:
+            notification = models.Notification(
+                user_id=employee.user_id,
+                title="Leave Approved",
+                message=(
+                    f"Your leave request from {leave.start_date} "
+                    f"to {leave.end_date} has been approved."
+                ),
+                is_read=False,
+                created_at=datetime.utcnow()
+            )
+
+            db.add(notification)
+            db.commit()
+
+        except Exception:
+            db.rollback()
+            print("Warning: Leave approved, but notification failed.")
+
+    return {
+        "message": "Leave approved successfully",
+        "leave": leave,
+        "leave_days_deducted": requested_days,
+        "remaining_days": balance.allocated_days - balance.used_days
+    }
+
+
+@app.put("/leaves/{leave_id}/reject")
+def reject_leave(
+    leave_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    leave = db.query(models.Leave).filter(
+        models.Leave.id == leave_id
+    ).first()
+
+    if not leave:
+        raise HTTPException(
+            status_code=404,
+            detail="Leave request not found"
+        )
+
+    if leave.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail="Leave request has already been processed"
+        )
+
+    leave.status = "REJECTED"
+    db.commit()
+    db.refresh(leave)
+
+    # Automatically notify the employee
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == leave.employee_id
+    ).first()
+
+    if employee and employee.user_id:
+        try:
+            notification = models.Notification(
+                user_id=employee.user_id,
+                title="Leave Rejected",
+                message=(
+                    f"Your leave request from {leave.start_date} "
+                    f"to {leave.end_date} has been rejected."
+                ),
+                is_read=False,
+                created_at=datetime.utcnow()
+            )
+
+            db.add(notification)
+            db.commit()
+
+        except Exception:
+            db.rollback()
+            print("Warning: Leave rejected, but notification failed.")
+
+    return {
+        "message": "Leave rejected successfully",
+        "leave": leave
+    }
+
+
+class LeaveCreate(BaseModel):
+    start_date: date
+    end_date: date
+    reason: str
+    policy_id: int
+
+@app.post("/leaves", status_code=201)
+def apply_leave(
+    leave_data: LeaveCreate,
+    db: Session = Depends(get_db),
+    user=Depends(current_user)
+):
+    # 1. Validate leave dates
+    if leave_data.end_date < leave_data.start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date cannot be before start date"
+        )
+
+    if leave_data.start_date < date.today():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot apply for leave in the past"
+        )
+
+    # 2. Find employee
+    employee = db.query(models.Employee).filter(
+        models.Employee.user_id == user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found"
+        )
+
+    # 3. Find active leave policy
     policy = db.query(models.LeavePolicy).filter(
         models.LeavePolicy.id == leave_data.policy_id,
         models.LeavePolicy.is_active == True
@@ -489,6 +890,50 @@ def apply_leave(
             detail="Active leave policy not found"
         )
 
+    # 4. Calculate requested leave days, including start and end dates
+    requested_days = (
+        leave_data.end_date - leave_data.start_date
+    ).days + 1
+
+    # 5. Check for overlapping pending or approved leave
+    overlapping_leave = db.query(models.Leave).filter(
+        models.Leave.employee_id == employee.id,
+        models.Leave.status.in_(["PENDING", "APPROVED"]),
+        models.Leave.start_date <= leave_data.end_date,
+        models.Leave.end_date >= leave_data.start_date
+    ).first()
+
+    if overlapping_leave:
+        raise HTTPException(
+            status_code=400,
+            detail="You already have a pending or approved leave during these dates"
+        )
+
+    # 6. Find the employee's leave balance for the selected policy and year
+    leave_year = leave_data.start_date.year
+
+    balance = db.query(models.LeaveBalance).filter(
+        models.LeaveBalance.employee_id == employee.id,
+        models.LeaveBalance.policy_id == policy.id,
+        models.LeaveBalance.year == leave_year
+    ).first()
+
+    if not balance:
+        raise HTTPException(
+            status_code=404,
+            detail="Leave balance not found for this policy and year"
+        )
+
+    # 7. Check remaining leave days
+    remaining_days = balance.allocated_days - balance.used_days
+
+    if requested_days > remaining_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient leave balance. Remaining days: {remaining_days}"
+        )
+
+    # 8. Create leave request
     leave = models.Leave(
         employee_id=employee.id,
         policy_id=policy.id,
@@ -503,8 +948,6 @@ def apply_leave(
     db.refresh(leave)
 
     return leave
-
-
 
 @app.get("/leaves")
 def get_my_leaves(
@@ -681,9 +1124,28 @@ def create_payroll(
     db.commit()
     db.refresh(payroll)
 
+    # Notify the employee about payroll creation
+    if employee.user_id:
+        try:
+            notification = models.Notification(
+                user_id=employee.user_id,
+                title="Payroll Generated",
+                message=(
+                    f"Your payroll for {month} has been generated. "
+                    f"Net salary: {payroll.net_salary}."
+                ),
+                is_read=False,
+                created_at=datetime.utcnow()
+            )
+
+            db.add(notification)
+            db.commit()
+
+        except Exception:
+            db.rollback()
+            print("Warning: Payroll created, but notification failed.")
+
     return payroll
-
-
 
   
 @app.get("/payroll")
@@ -1037,6 +1499,7 @@ def update_leave_status(
     db.commit()
     db.refresh(leave)
     return leave
+
 @app.patch("/leaves/{leave_id}/status")
 def update_leave_status(
     leave_id: int,
@@ -1170,6 +1633,13 @@ def create_leave_balance(
     db.refresh(balance)
 
     return balance
+
+@app.get("/leave-balances")
+def get_all_leave_balances(
+    db: Session = Depends(get_db),
+    user=Depends(allow_roles("HR", "ADMIN"))
+):
+    return db.query(models.LeaveBalance).all()
   
 @app.get("/leave-balances/{employee_id}")
 def get_leave_balance(
@@ -1265,3 +1735,49 @@ def get_admin_users(
         for user in users
     ]
 
+@app.get("/leaves/calendar", tags=["Leave Management"])
+def leave_calendar(
+    db: Session = Depends(get_db),
+):
+    leaves = db.query(Leave).filter(
+        Leave.status == "APPROVED"
+    ).all()
+
+    return [
+        {
+            "id": leave.id,
+            "employee_id": leave.employee_id,
+            "start_date": leave.start_date,
+            "end_date": leave.end_date,
+            "reason": leave.reason,
+            "status": leave.status,
+        }
+        for leave in leaves
+    ]
+
+@app.get("/leaves/team-availability", tags=["Leave Management"])
+def get_team_availability(db: Session = Depends(get_db)):
+    employees = db.query(Employee).all()
+
+    result = []
+
+    for employee in employees:
+        approved_leaves = db.query(Leave).filter(
+            Leave.employee_id == employee.id,
+            Leave.status == "APPROVED"
+        ).all()
+
+        result.append({
+            "employee_id": employee.id,
+            "employee_name": employee.full_name,
+            "approved_leaves": [
+                {
+                    "start_date": leave.start_date,
+                    "end_date": leave.end_date,
+                    "reason": leave.reason
+                }
+                for leave in approved_leaves
+            ]
+        })
+
+    return result

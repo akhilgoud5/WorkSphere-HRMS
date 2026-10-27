@@ -52,7 +52,7 @@ class LeaveIn(BaseModel):
     start_date: date
     end_date: date
     reason: str = Field(min_length=1, max_length=500)
-
+    policy_id: int | None = None
 
 class LeaveOut(BaseModel):
     id: int
@@ -62,5 +62,22 @@ class LeaveOut(BaseModel):
     reason: str
     status: str
     created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+class LeaveBalanceCreate(BaseModel):
+    employee_id: int
+    policy_id: int
+    year: int
+    allocated_days: int = Field(ge=0)
+
+
+class LeaveBalanceOut(BaseModel):
+    id: int
+    employee_id: int
+    policy_id: int
+    year: int
+    allocated_days: int
+    used_days: int
 
     model_config = ConfigDict(from_attributes=True)
