@@ -1,9 +1,23 @@
 from datetime import datetime, date
-from sqlalchemy import Column, Integer, String, Date, DateTime, Float, ForeignKey
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Boolean,
+    Time,
+    Text,
+)
 from .database import Base
 from sqlalchemy import Boolean, DateTime, ForeignKey
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy import Time
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from sqlalchemy import Text
 
 class User(Base):
     __tablename__ = "users"
@@ -175,3 +189,86 @@ class Notification(Base):
     message = Column(String(500), nullable=False)
     is_read = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class Onboarding(Base):
+    __tablename__ = "onboarding"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id"),
+        nullable=False,
+        index=True
+    )
+
+    task_name = Column(String(200), nullable=False)
+
+    status = Column(
+        String(20),
+        default="PENDING",
+        nullable=False
+    )
+
+    due_date = Column(Date, nullable=True)
+
+    employee = relationship("Employee")
+
+class Resignation(Base):
+    __tablename__ = "resignations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id"),
+        nullable=False
+    )
+    reason = Column(Text, nullable=False)
+    proposed_last_working_date = Column(Date, nullable=False)
+    status = Column(String(20), default="PENDING", nullable=False)
+
+class Announcement(Base):
+    __tablename__ = "announcements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    assigned_to = Column(
+        Integer,
+        ForeignKey("employees.id"),
+        nullable=False
+    )
+
+    title = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    due_date = Column(Date, nullable=True)
+
+    status = Column(String(20), default="PENDING")
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id"),
+        nullable=False
+    )
+
+    message = Column(Text, nullable=False)
+
+    rating = Column(Integer, nullable=False)
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )    

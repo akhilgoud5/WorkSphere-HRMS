@@ -1,6 +1,8 @@
 from datetime import datetime, date
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
+from typing import Literal
+
 class RegisterIn(BaseModel):
     username: str = Field(min_length=3, max_length=80)
     email: EmailStr
@@ -81,3 +83,45 @@ class LeaveBalanceOut(BaseModel):
     used_days: int
 
     model_config = ConfigDict(from_attributes=True)
+
+class OnboardingCreate(BaseModel):
+    employee_id: int = Field(gt=0)
+    task_name: str = Field(min_length=1, max_length=200)
+    due_date: date | None = None
+
+
+class OnboardingStatusUpdate(BaseModel):
+    status: Literal["PENDING", "COMPLETED"]
+
+
+class OnboardingOut(BaseModel):
+    id: int
+    employee_id: int
+    task_name: str
+    status: str
+    due_date: date | None = None
+
+    class Config:
+        from_attributes = True   
+
+
+
+class FeedbackCreate(BaseModel):
+    message: str = Field(..., min_length=3, max_length=2000)
+    rating: int = Field(..., ge=1, le=5)
+
+
+class FeedbackOut(BaseModel):
+    id: int
+    employee_id: int
+    message: str
+    rating: int
+    created_at : datetime
+
+    class Config:
+        from_attributes = True        
+
+class ProfileUpdate(BaseModel):
+    full_name: str | None = Field(None, min_length=2, max_length=150)
+    designation: str | None = Field(None, max_length=100)
+    department: str | None = Field(None, max_length=100)        

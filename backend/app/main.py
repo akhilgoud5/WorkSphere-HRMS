@@ -23,6 +23,17 @@ from app.models import User, Employee, Leave
 from app.routers import analytics
 from datetime import datetime, timedelta
 from app.models import Notification
+from app.routers import onboarding
+from app.routers import resignation
+from app.routers import announcements
+from app.routers import tasks
+from app.routers import reports
+from app.models import Feedback, Employee
+from app.schemas import FeedbackCreate, FeedbackOut
+from app.dependencies import get_current_user
+from app.dependencies import get_logged_in_user
+from app.database import get_db
+from app.schemas import ProfileUpdate
 
 app = FastAPI(title="WorkSphere HRMS API", version="1.0.0",
               description="Starter API for WorkSphere HR Management System")
@@ -54,6 +65,11 @@ app.include_router(documents.router)
 app.include_router(performance.router)
 app.include_router(notifications.router)
 app.include_router(analytics.router)
+app.include_router(onboarding.router)
+app.include_router(resignation.router)
+app.include_router(announcements.router)
+app.include_router(tasks.router)
+app.include_router(reports.router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1781,3 +1797,117 @@ def get_team_availability(db: Session = Depends(get_db)):
         })
 
     return result
+
+@app.post("/feedback", response_model=FeedbackOut, status_code=201)
+def create_feedback(
+    data: FeedbackCreate,
+    db: Session = Depends(get_db),
+   current_user=Depends(get_logged_in_user),
+):
+    employee = db.query(Employee).filter(
+        Employee.user_id == current_user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found",
+        )
+
+    feedback = Feedback(
+        employee_id=employee.id,
+        message=data.message,
+        rating=data.rating,
+    )
+
+    db.add(feedback)
+    db.commit()
+    db.refresh(feedback)
+
+    return feedback
+
+
+@app.get("/feedback/me", response_model=list[FeedbackOut])
+def get_my_feedback(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_logged_in_user),
+):
+    employee = db.query(Employee).filter(
+        Employee.user_id == current_user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found",
+        )
+
+    return db.query(Feedback).filter(
+        Feedback.employee_id == employee.id
+    ).all()
+
+@app.get("/profile/me")
+def get_my_profile(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_logged_in_user),
+):
+    employee = db.query(Employee).filter(
+        Employee.user_id == current_user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found",
+        )
+
+    return {
+        "id": employee.id,
+        "user_id": employee.user_id,
+        "full_name": employee.full_name,
+        "designation": employee.designation,
+        "department": employee.department,
+        "joining_date": employee.joining_date,
+        "salary": employee.salary,
+        "status": employee.status,
+    }
+
+@app.put("/profile/me")
+def update_my_profile(
+    data: ProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_logged_in_user),
+):
+    employee = db.query(Employee).filter(
+        Employee.user_id == current_user.id
+    ).first()
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee profile not found",
+        )
+
+    if data.full_name is not None:
+        employee.full_name = data.full_name
+
+    if data.designation is not None:
+        employee.designation = data.designation
+
+    if data.department is not None:
+        employee.department = data.department
+
+    db.commit()
+    db.refresh(employee)
+
+    return {
+        "message": "Profile updated successfully",
+        "id": employee.id,
+        "user_id": employee.user_id,
+        "full_name": employee.full_name,
+        "designation": employee.designation,
+        "department": employee.department,
+        "joining_date": employee.joining_date,
+        "salary": employee.salary,
+        "status": employee.status,
+    }
